@@ -225,10 +225,27 @@ STATE_FILE = os.environ.get("STATE_FILE", os.path.join(os.path.dirname(os.path.a
 # rules and the master pause switch, so you can test the funnel from a second
 # account at any time. These accounts can also message "stats" to get a
 # stats summary back instead of a funnel reply.
+#
+# A Telegram account only HAS a @username if one was explicitly set (Settings
+# -> Username in the Telegram app) — plenty of accounts never set one, in
+# which case TEST_USERNAMES can never match them no matter what's typed here.
+# TEST_CHAT_IDS below is the fallback for that case.
 TEST_USERNAMES = {
     u.strip().lstrip("@").lower()
     for u in os.environ.get("TEST_USERNAMES", "").split(",")
     if u.strip()
+}
+
+# Comma-separated numeric Telegram user IDs — same bypass as TEST_USERNAMES,
+# but keyed on the account's permanent numeric ID instead of its @username.
+# Use this for a tester whose account has no @username set. Get your own ID
+# by messaging a bot like @userinfobot from the account you want to use for
+# testing, or by checking "chat_id" in a "Needs Your Reply" card / log line
+# on the dashboard the first time that account messages the bot.
+TEST_CHAT_IDS = {
+    int(x.strip())
+    for x in os.environ.get("TEST_CHAT_IDS", "").split(",")
+    if x.strip().lstrip("-").isdigit()
 }
 
 # ─── Chat stages ───────────────────────────────────────────────────────────
@@ -2496,22 +2513,35 @@ async def handle_message(event, client):
         else (sender.first_name or str(chat_id))
     )
     username = sender.username
-    is_test_user = bool(username) and username.lower() in TEST_USERNAMES
+    is_test_user = (
+        (bool(username) and username.lower() in TEST_USERNAMES)
+        or chat_id in TEST_CHAT_IDS
+    )
 
     stats["messages_today"] += 1
     hourly_messages[datetime.now(timezone.utc).hour] += 1
-    log.info(f"[{sender_name}] {text[:80]!r}" + (" [media]" if has_media else ""))
-
     stage = get_stage(chat_id)
+    log.info(
+        f"[{sender_name}] (id {chat_id}) {text[:80]!r}"
+        + (" [media]" if has_media else "")
+        + (" [TEST]" if is_test_user else "")
+        + f" stage={stage}"
+    )
 
-    # ── Test account — always gets a reply. "stats"/"status" pulls live stats;
-    #    "reset" wipes this chat's saved progress so the next message replays
-    #    the whole funnel from the welcome message instead of resuming where
-    #    a previous test run left off. Ending ANY message with ">>" does both
-    #    in one shot — wipes the saved progress AND immediately sends the
-    #    welcome, so you can retest the whole flow from scratch without
-    #    sending "reset" as a separate message first. Without ">>", messages
-    #    fall through to the normal stage-aware funnel logic as usual ───────
+    # ── Test account — always gets a reply, and completely bypasses the
+    #    owner-silence/pause/already-replied checks below (see the `else:`
+    #    branch right after this one) — so a stale stage from earlier
+    #    testing (e.g. STAGE_OWNER) can never leave a test account stuck
+    #    silent. "stats"/"status" pulls live stats. "reset" wipes this
+    #    chat's saved progress so the next message replays the whole funnel
+    #    from the welcome message instead of resuming where a previous test
+    #    run left off. A message that STARTS WITH "_" (underscore) — or,
+    #    kept for backwards compatibility, ENDS WITH ">>" — does both in one
+    #    shot: wipes the saved progress AND immediately sends the welcome,
+    #    so you can retest the whole flow from scratch without sending
+    #    "reset" as a separate message first, e.g. send "_" or "_hi" to
+    #    restart. Anything else (a plain "hi", etc.) falls through to the
+    #    normal stage-aware funnel logic as usual ─────────────────────────
     if is_test_user:
         cmd = text.lower().strip().lstrip("/")
         if cmd in ("stats", "status", "stats>>"):
@@ -2528,7 +2558,7 @@ async def handle_message(event, client):
             )
             log.info(f"[{sender_name}] Test user reset their chat state")
             return
-        if text.rstrip().endswith(">>"):
+        if text.strip().startswith("_") or text.rstrip().endswith(">>"):
             chat_states.pop(chat_id, None)
             clear_pending(chat_id)
             await human_delay(event, client, 6.0, 11.0)
@@ -2538,7 +2568,7 @@ async def handle_message(event, client):
             stats["new_chats_today"] += 1
             pipeline["welcomed"] += 1
             _record_action(sender_name, "welcome")
-            log.info(f"[{sender_name}] Test user restart trigger (>>) — reset and sent welcome")
+            log.info(f"[{sender_name}] Test user restart trigger — reset and sent welcome")
             return
     else:
         # ── 1. Pre-existing / owner-handling contact — permanent silence ───────
