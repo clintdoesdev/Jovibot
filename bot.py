@@ -5,16 +5,15 @@ Railway-ready. Uses StringSession so no .session file needed.
 
 FLOW
 ----
-Every brand-new contact gets the full Jovia welcome message — brand intro,
-how it works, and both packages (Gold/Silver) — on their very first message,
-whatever it says. There's no separate "what's your name?" step: the bot uses
-the sender's Telegram first name automatically. From there the fixed
-sequence is:
-  1. WELCOME    -> bot sends the full Jovia Network intro + packages message
-                    (one message, immediately, on the first-ever contact)
-  2. SIGNUP     -> once they signal they're ready to join, bot sends the
-                    registration link and package pricing
-  3. HUMAN TAKEOVER -> anything that isn't a clean "next step" — already
+Every brand-new contact gets a short Jovia Network welcome on their very
+first message, whatever it says, then goes through a fixed sequence:
+  1. WELCOME   -> bot sends a short Jovia Network intro and asks their name
+  2. REAL DEAL -> once they reply with their name, bot sends the flyer image
+                   (see JOVIA_FLYER_PATH) with the full how-it-works +
+                   packages (Gold/Silver) write-up as its caption
+  3. SIGNUP    -> once they signal they're ready to join, bot sends the
+                   registration link and package pricing
+  4. HUMAN TAKEOVER -> anything that isn't a clean "next step" — already
      joined, hesitating, making small talk, or sending a flagged message —
      gets ZERO auto-reply. It's queued on the dashboard under "Needs Your
      Reply" (with a push notification) so you can jump in personally. The
@@ -83,10 +82,32 @@ FACEBOOK_FLOW_ENABLED = os.environ.get("FACEBOOK_FLOW_ENABLED", "false").lower()
 # auto-sent — they're queued to "Needs Your Reply" for a manual look instead.
 CATCH_UP_SAFETY_CAP = int(os.environ.get("CATCH_UP_SAFETY_CAP", "10"))
 
-# ── Step 1: first contact — the full Jovia Network intro, how-it-works, and
-#    both packages in one message. Sent immediately on the very first
-#    message from a brand-new contact, using their Telegram first name — no
-#    separate "what's your name?" step.
+# Local path to the flyer image sent alongside the "real deal" (the full
+# how-it-works + packages write-up, as its caption — see JOVIA_WELCOME_MESSAGE
+# below). Resolved relative to this file so it works regardless of the
+# process's working directory. Point this at a different file (or an
+# https:// URL) via env var if the flyer ever changes.
+JOVIA_FLYER_PATH = os.environ.get(
+    "JOVIA_FLYER_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "jovia_fbr_flyer.jpg"),
+)
+
+# ── Step 1: first contact — a short Jovia Network welcome, then ask their
+#    name. Kept short so it reads well as a chat bubble, and deliberately
+#    doesn't reveal packages/pricing yet — that's the "real deal" message
+#    below, sent once they've replied with their name.
+JOVIA_WELCOME_INTROS = [
+    (
+        "💙 Welcome to Jovia Network 🌍\n\n"
+        "You get to earn from digital activities, content, games, music, and sales, "
+        "all from one place, wherever you are.\n\n"
+        "Ready to get started? What's your name?"
+    ),
+]
+
+# ── Step 2: the "real deal" — brand intro, how-it-works, and both packages
+#    (Gold/Silver). Sent as the CAPTION on the JOVIA_FLYER_PATH image (see
+#    send_reply_with_image / handle_message) once they've told us their name.
 JOVIA_WELCOME_MESSAGE = (
     "🌹 JOVIA NETWORK\n\n"
     "Great to meet you, {name}! 🎉\n\n"
@@ -250,7 +271,8 @@ TEST_CHAT_IDS = {
 
 # ─── Chat stages ───────────────────────────────────────────────────────────
 STAGE_NEW      = "new"             # never messaged before
-STAGE_EXPLAINED = "explained"      # full welcome + packages message has been sent
+STAGE_WELCOMED = "welcomed"        # short welcome sent, waiting on their name
+STAGE_EXPLAINED = "explained"      # "real deal" (flyer image + packages caption) has been sent
 STAGE_SIGNUP   = "signup_sent"     # signup/registration link has been sent
 STAGE_OWNER    = "owner_handling"  # pre-existing contact, or you stepped in manually — bot is silent forever
 STAGE_SOCIAL_WELCOMED = "social_welcomed"  # social-referral welcome sent, waiting on name
@@ -575,12 +597,13 @@ def load_state() -> bool:
                        ("messages_today", "new_chats_today", "replies_sent", "flags_total",
                         "facebook_prompts_today")},
                     "welcomed":     data.get("pipeline", {}).get("welcomed", 0),
+                    "info_sent":    data.get("pipeline", {}).get("info_sent", 0),
                     "signup_sent": data.get("pipeline", {}).get("signup_sent", 0),
                 }
                 daily_history.append(entry)
                 while len(daily_history) > 7:
                     daily_history.pop(0)
-                pipeline.update({"welcomed": 0, "signup_sent": 0})
+                pipeline.update({"welcomed": 0, "info_sent": 0, "signup_sent": 0})
                 stats_date = today
                 log.info(f"📅 Day rollover detected ({saved_date} → {today}) — stats reset")
             # facebook_prompts_total is all-time and survives every rollover,
@@ -620,6 +643,7 @@ def _reset_daily_stats():
         "replies_sent":     stats["replies_sent"],
         "flags_total":      stats["flags_total"],
         "welcomed":         pipeline["welcomed"],
+        "info_sent":        pipeline["info_sent"],
         "signup_sent":     pipeline["signup_sent"],
         "facebook_prompts_today": stats["facebook_prompts_today"],
     })
@@ -634,6 +658,7 @@ def _reset_daily_stats():
     # facebook_prompts_total is deliberately NOT reset here — it's an
     # all-time counter that survives every daily rollover.
     pipeline["welcomed"]     = 0
+    pipeline["info_sent"]    = 0
     pipeline["signup_sent"] = 0
     for i in range(24):
         hourly_messages[i] = 0
@@ -730,7 +755,7 @@ _push_executor = ThreadPoolExecutor(max_workers=2)
 # 24-slot hourly message counter
 hourly_messages: list = [0] * 24
 # Per-pipeline action counts
-pipeline: dict = {"welcomed": 0, "signup_sent": 0}
+pipeline: dict = {"welcomed": 0, "info_sent": 0, "signup_sent": 0}
 # Live action feed (last 20 actions)
 recent_actions: deque = deque(maxlen=20)
 # Daily tracking
@@ -1087,13 +1112,12 @@ async def catch_up_unreplied(client):
             break
 
         try:
-            welcome_name = getattr(entity, "first_name", None) or "there"
-            sent = await client.send_message(cid, build_welcome_message(welcome_name))
+            sent = await client.send_message(cid, random.choice(JOVIA_WELCOME_INTROS))
             chat_states[cid] = {
-                "stage": STAGE_EXPLAINED,
+                "stage": STAGE_WELCOMED,
                 "display_name": sender_name,
                 "username": username,
-                "name": welcome_name,
+                "name": None,
                 "last_bot_msg_id": sent.id,
                 "first_seen": cs.get("first_seen", _now_iso()),
                 "last_seen": _now_iso(),
@@ -1460,9 +1484,11 @@ DASHBOARD_HTML = """\
     .ab-flag     { background:var(--rdd); color:var(--red); }
     .fb-new  { background:var(--gnd); color:var(--green); }
     .fb-wlc  { background:var(--tld); color:var(--teal); }
+    .fb-info { background:var(--bld); color:var(--blue); }
     .fb-pay  { background:var(--gd);  color:var(--gold); }
     .ff-new  { background:var(--green); }
     .ff-wlc  { background:var(--teal); }
+    .ff-info { background:var(--blue); }
     .ff-pay  { background:var(--gold); }
 
     /* ── Main content: log + sidebar ── */
@@ -1707,7 +1733,11 @@ DASHBOARD_HTML = """\
   </div>
   <div class="stat ct">
     <div class="st"><div class="sl">Welcomed</div><i class="ph-fill ph-hand-waving si"></i></div>
-    <div class="sv" id="sWlc">—</div><div class="sn">Packages sent</div>
+    <div class="sv" id="sWlc">—</div><div class="sn">Step 1 done</div>
+  </div>
+  <div class="stat cpk">
+    <div class="st"><div class="sl">Real Deal Sent</div><i class="ph-fill ph-image si"></i></div>
+    <div class="sv" id="sInfo">—</div><div class="sn">Flyer + packages</div>
   </div>
   <div class="stat cb">
     <div class="st"><div class="sl">Signup Links</div><i class="ph-fill ph-currency-circle-dollar si"></i></div>
@@ -1716,10 +1746,6 @@ DASHBOARD_HTML = """\
   <div class="stat cp">
     <div class="st"><div class="sl">Direct Sale Q's</div><i class="ph-fill ph-crown si"></i></div>
     <div class="sv" id="sPrime">—</div><div class="sn">Asked about referrals</div>
-  </div>
-  <div class="stat cpk">
-    <div class="st"><div class="sl">Social Prompts</div><i class="ph-fill ph-share-network si"></i></div>
-    <div class="sv" id="sSocial">—</div><div class="sn">Today</div>
   </div>
   <div class="stat cr" id="stPending">
     <div class="st"><div class="sl">Needs Reply</div><i class="ph-fill ph-bell-ringing si"></i></div>
@@ -1880,10 +1906,10 @@ DASHBOARD_HTML = """\
       if (c.msg    != null) document.getElementById('sMsgs').textContent    = c.msg;
       if (c.nw     != null) document.getElementById('sNew').textContent     = c.nw;
       if (c.wlc    != null) document.getElementById('sWlc').textContent     = c.wlc;
+      if (c.inf    != null) document.getElementById('sInfo').textContent    = c.inf;
       if (c.pay    != null) document.getElementById('sPay').textContent     = c.pay;
       if (c.fail   != null) document.getElementById('sFail').textContent    = c.fail;
       if (c.prime  != null) document.getElementById('sPrime').textContent   = c.prime;
-      if (c.social != null) document.getElementById('sSocial').textContent  = c.social;
       if (c.rep    != null) hReplies.textContent = c.rep;
       if (c.flags  != null) hFlags.textContent = c.flags;
       if (c.pend   != null) document.getElementById('sPending').textContent = c.pend;
@@ -1897,10 +1923,10 @@ DASHBOARD_HTML = """\
         msg:    d.stats   ? d.stats.messages_today   : 0,
         nw:     d.stats   ? d.stats.new_chats_today  : 0,
         wlc:    d.pipeline? d.pipeline.welcomed       : 0,
+        inf:    d.pipeline? d.pipeline.info_sent      : 0,
         pay:    d.pipeline? d.pipeline.signup_sent   : 0,
         fail:   d.stats   ? d.stats.failed_sends      : 0,
         prime:  d.stats   ? d.stats.referral_inquiries   : 0,
-        social: d.stats   ? d.stats.facebook_prompts_today : 0,
         rep:    d.stats   ? d.stats.replies_sent      : 0,
         flags:  d.stats   ? d.stats.flags_total       : 0,
         pend:   d.pending_review ? d.pending_review.length : 0,
@@ -1962,6 +1988,7 @@ DASHBOARD_HTML = """\
     var rows = [
       {lbl:'New',     cls:'fb-new',  fill:'ff-new',  count:total,             pct:100},
       {lbl:'Welcome', cls:'fb-wlc',  fill:'ff-wlc',  count:p.welcomed||0,     pct:Math.round((p.welcomed||0)/total*100)},
+      {lbl:'Real Deal', cls:'fb-info', fill:'ff-info', count:p.info_sent||0,  pct:Math.round((p.info_sent||0)/total*100)},
       {lbl:'Signup',  cls:'fb-pay',  fill:'ff-pay',  count:p.signup_sent||0, pct:Math.round((p.signup_sent||0)/total*100)},
     ];
     el.innerHTML = rows.map(function(r){
@@ -2124,12 +2151,12 @@ DASHBOARD_HTML = """\
         document.getElementById('sNew').textContent     = d.stats.new_chats_today;
         document.getElementById('sFail').textContent    = d.stats.failed_sends;
         document.getElementById('sPrime').textContent   = d.stats.referral_inquiries;
-        document.getElementById('sSocial').textContent  = d.stats.facebook_prompts_today;
         hReplies.textContent = d.stats.replies_sent;
         hFlags.textContent   = d.stats.flags_total || 0;
       }
       if(d.pipeline){
         document.getElementById('sWlc').textContent  = d.pipeline.welcomed;
+        document.getElementById('sInfo').textContent = d.pipeline.info_sent;
         document.getElementById('sPay').textContent  = d.pipeline.signup_sent;
       }
       document.getElementById('sPending').textContent = (d.pending_review||[]).length;
@@ -2161,7 +2188,7 @@ DASHBOARD_HTML = """\
     var m = msg.toLowerCase();
     if (m.includes('signup link') || m.includes('registration link')) return 'SIGNUP';
     if (m.includes('direct sale') || m.includes('referral')) return 'REFERRAL';
-    if (m.includes('package details')) return 'INFO';
+    if (m.includes('real deal')) return 'INFO';
     if (m.includes('welcome') || m.includes('first contact')) return 'WELCOME';
     if (m.includes('flagged') || m.includes('needs manual') || m.includes('needs a reply')) return 'FLAG';
     if (m.includes('silent') || m.includes('owner') || m.includes('skip')) return 'SILENT';
@@ -2482,18 +2509,21 @@ async def api_logs(request: Request):
 #  7b. Social-referral opener, counted in stats either way; sends its own
 #      social welcome message only if FACEBOOK_FLOW_ENABLED (off by
 #      default) — otherwise falls through to the main funnel below
-#   8. Brand-new contact                              -> send the full
-#      welcome + packages message immediately (uses their Telegram first
-#      name — no "what's your name?" step). Payment-ready openers never
-#      reach here, and social-referral openers only stop here when the
-#      flow above is enabled — they were already handled above at 2c/7b.
+#   8. Brand-new contact                              -> send the short
+#      welcome and ask their name. Payment-ready openers never reach here,
+#      and social-referral openers only stop here when the flow above is
+#      enabled — they were already handled above at 2c/7b.
 #   9. Direct Sale / referral question                -> answer directly
-#  10. Clear "I'm ready / let's go / how do we continue"  -> signup link
-#  11. Specific package/feature question              -> resend the welcome/
-#      packages message
-#  12. Unrecognised message at signup stage           -> resend signup link
-#  13. Unrecognised text at explained stage           -> flag, silence
-#  14. Anything else                                  -> silence, no chit-chat
+#  10. Clear "I'm ready / let's go / how do we continue", excluding
+#      STAGE_WELCOMED                                  -> signup link
+#  11. Specific package/feature question              -> send the real deal
+#      (flyer image + packages caption)
+#  12. Any reply right after the welcome              -> send the real deal
+# 12b. Any reply right after the social welcome        -> subtle explanation
+#      + channel link
+#  13. Unrecognised message at signup stage           -> resend signup link
+#  14. Unrecognised text at explained stage           -> flag, silence
+#  15. Anything else                                  -> silence, no chit-chat
 
 async def handle_message(event, client):
     if not event.is_private:
@@ -2562,9 +2592,8 @@ async def handle_message(event, client):
             chat_states.pop(chat_id, None)
             clear_pending(chat_id)
             await human_delay(event, client, 6.0, 11.0)
-            welcome_name = sender.first_name or "there"
-            await send_reply(event, build_welcome_message(welcome_name))
-            set_stage(chat_id, STAGE_EXPLAINED, sender_name, username, name=welcome_name)
+            await send_reply(event, random.choice(JOVIA_WELCOME_INTROS))
+            set_stage(chat_id, STAGE_WELCOMED, sender_name, username)
             stats["new_chats_today"] += 1
             pipeline["welcomed"] += 1
             _record_action(sender_name, "welcome")
@@ -2690,20 +2719,18 @@ async def handle_message(event, client):
             return
         log.info(f"[{sender_name}] Social-referral opener detected (flow disabled) — falling through to main funnel")
 
-    # ── 8. Brand-new contact — send the full welcome + packages message
-    #      immediately (no separate name-asking step — the Telegram first
-    #      name is used automatically), then let the normal staged flow
-    #      continue from there. Social-referral and payment-ready openers
-    #      never reach here — they're handled above at 7b and 2c.
+    # ── 8. Brand-new contact — always send the short welcome and let the
+    #      normal staged flow continue from there (name capture next, then
+    #      the real deal, then signup). Social-referral and payment-ready
+    #      openers never reach here — they're handled above at 7b and 2c.
     if stage == STAGE_NEW:
-        welcome_name = sender.first_name or "there"
         await human_delay(event, client, 6.0, 11.0)
-        await send_reply(event, build_welcome_message(welcome_name))
-        set_stage(chat_id, STAGE_EXPLAINED, sender_name, username, name=welcome_name)
+        await send_reply(event, random.choice(JOVIA_WELCOME_INTROS))
+        set_stage(chat_id, STAGE_WELCOMED, sender_name, username)
         stats["new_chats_today"] += 1
         pipeline["welcomed"] += 1
         _record_action(sender_name, "welcome")
-        log.info(f"[{sender_name}] Sent: welcome + packages")
+        log.info(f"[{sender_name}] Sent: welcome")
         return
 
     # ── 9. Direct Sale / referral question — always answer ────────────────────
@@ -2715,8 +2742,12 @@ async def handle_message(event, client):
         log.info(f"[{sender_name}] Sent: direct sale & spillover info")
         return
 
-    # ── 10. Clear join intent — signup link (or a short reminder) ─────────────
-    if text and matches_join_intent(text):
+    # ── 10. Clear join intent — signup link (or a short reminder). Excludes
+    #        STAGE_WELCOMED so a generic "I am ready" reply right after the
+    #        welcome is still treated as their name (step 12) and gets the
+    #        real deal — the payment link only follows a generic readiness
+    #        signal once the real deal is already out.
+    if text and stage != STAGE_WELCOMED and matches_join_intent(text):
         if stage == STAGE_SIGNUP:
             await human_delay(event, client, 3.0, 6.0)
             await send_reply(event, SIGNUP_LINK_REMINDER)
@@ -2732,24 +2763,30 @@ async def handle_message(event, client):
         log.info(f"[{sender_name}] Sent: signup link")
         return
 
-    # ── 11. Specific package/feature question — resend the welcome/packages ───
+    # ── 11. Specific package/feature question — answer with the real deal
+    #        (flyer image + packages caption), even before their name has
+    #        been captured (falls back to their Telegram first name).
     if text and matches_info_request(text):
-        name = get_name(chat_id) or sender.first_name
+        name = get_name(chat_id) or sender.first_name or ""
         await human_delay(event, client, 5.0, 9.0)
-        await send_reply(event, build_welcome_message(name))
-        if stage == STAGE_NEW:
+        await send_real_deal(event, name)
+        if stage in (STAGE_NEW, STAGE_WELCOMED):
             set_stage(chat_id, STAGE_EXPLAINED, sender_name, username, name=name)
-            pipeline["welcomed"] += 1
+            pipeline["info_sent"] += 1
         _record_action(sender_name, "info")
-        log.info(f"[{sender_name}] Sent: package details (asked directly)")
+        log.info(f"[{sender_name}] Sent: real deal (asked directly)")
         return
 
-    # ── 12. Unrecognised message at signup stage — resend the link ────────────
-    if stage == STAGE_SIGNUP:
-        await human_delay(event, client, 3.0, 6.0)
-        await send_reply(event, SIGNUP_LINK_REMINDER)
-        _record_action(sender_name, "signup")
-        log.info(f"[{sender_name}] Sent: signup link reminder (unrecognised msg at signup stage)")
+    # ── 12. Reply right after the welcome = their name -> the real deal
+    #        (flyer image + packages caption) ──────────────────────────────
+    if stage == STAGE_WELCOMED:
+        name = extract_name(text, fallback=sender.first_name or "")
+        await human_delay(event, client, 5.0, 10.0)
+        await send_real_deal(event, name)
+        set_stage(chat_id, STAGE_EXPLAINED, sender_name, username, name=name)
+        pipeline["info_sent"] += 1
+        _record_action(sender_name, "info")
+        log.info(f"[{sender_name}] Sent: real deal (name: {name!r})")
         return
 
     # ── 12b. Reply right after the social welcome = their name -> subtle
@@ -2764,18 +2801,34 @@ async def handle_message(event, client):
         log.info(f"[{sender_name}] Sent: social explainer + channel link (name: {name!r})")
         return
 
-    # ── 13. Unrecognised text at explained stage — queue for human reply ──────
+    # ── 13. Unrecognised message at signup stage — resend the link ────────────
+    if stage == STAGE_SIGNUP:
+        await human_delay(event, client, 3.0, 6.0)
+        await send_reply(event, SIGNUP_LINK_REMINDER)
+        _record_action(sender_name, "signup")
+        log.info(f"[{sender_name}] Sent: signup link reminder (unrecognised msg at signup stage)")
+        return
+
+    # ── 14. Unrecognised text at explained stage — queue for human reply ──────
     if stage == STAGE_EXPLAINED and text:
         add_pending(chat_id, sender_name, username, "chitchat", text)
         log.info(f"[{sender_name}] Unrecognised msg in EXPLAINED stage — queued for reply")
         return
 
-    # ── 14. Everything else — no unnecessary chit-chat, stay silent ───────────
+    # ── 15. Everything else — no unnecessary chit-chat, stay silent ───────────
     log.info(f"[{sender_name}] No matching rule — silent")
 
 
 def build_welcome_message(name: str = "") -> str:
     return JOVIA_WELCOME_MESSAGE.format(name=name or "there")
+
+
+async def send_real_deal(event, name: str = "") -> bool:
+    """Sends the "real deal": the Jovia flyer image (JOVIA_FLYER_PATH) with
+    the full how-it-works + packages write-up as its caption — via
+    send_reply_with_image, which auto-splits the caption into a caption +
+    followup text message if it's over Telegram's photo-caption limit."""
+    return await send_reply_with_image(event, build_welcome_message(name), JOVIA_FLYER_PATH)
 
 
 def build_signup_message(name: str = "") -> str:
@@ -2802,6 +2855,7 @@ def build_stats_reply() -> str:
         f"Referral inquiries: {stats['referral_inquiries']}\n"
         f"Flags total: {stats['flags_total']}\n\n"
         f"Welcomed: {pipeline['welcomed']}\n"
+        f"Real deal sent: {pipeline['info_sent']}\n"
         f"Signup links sent: {pipeline['signup_sent']}\n\n"
         f"Social prompts today: {stats['facebook_prompts_today']}\n"
         f"Social prompts total: {stats['facebook_prompts_total']}\n\n"
