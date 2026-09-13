@@ -12,7 +12,12 @@ first message, whatever it says, then goes through a fixed sequence:
                    (see JOVIA_FLYER_PATH) with the full how-it-works +
                    packages (Gold/Silver) write-up as its caption
   3. SIGNUP    -> once they signal they're ready to join, bot sends the
-                   registration link and package pricing
+                   registration link and package pricing (STAGE_SIGNUP).
+                   The FIRST message after that gets exactly one reminder
+                   (STAGE_SIGNUP_REMINDED) — after that reminder, the bot
+                   never auto-replies in that chat again, no matter what
+                   they send (a genuine "I've paid, here's my receipt" is
+                   the one exception — see below).
   4. HUMAN TAKEOVER -> anything that isn't a clean "next step" — already
      joined, hesitating, making small talk, or sending a flagged message —
      gets ZERO auto-reply. It's queued on the dashboard under "Needs Your
@@ -26,10 +31,12 @@ almost everything else:
 - An explicit payment-ready phrase (see PAYMENT_READY_PHRASES /
   matches_payment_ready), e.g. "I'm ready to make payment for Jovia Gold,
   please drop the payment link" — always gets the full signup write-up
-  immediately, and is the one thing that bypasses the pause switch.
-  A bare "I am ready" with no mention of paying does NOT trigger this — it
-  only counts as join intent once the welcome has already been sent (see
-  JOIN_KEYWORDS / matches_join_intent).
+  immediately, and is the one thing that bypasses the pause switch — UNLESS
+  the signup link has already gone out (STAGE_SIGNUP/STAGE_SIGNUP_REMINDED),
+  in which case it's covered by the one-reply-then-silent rule above instead
+  of resending the link again. A bare "I am ready" with no mention of paying
+  does NOT trigger this — it only counts as join intent once the welcome has
+  already been sent (see JOIN_KEYWORDS / matches_join_intent).
 - A social-referral opener (see matches_social_interest), e.g. "From
   Facebook, I'm Interested in getting started with Jovia". This is always
   counted in stats (facebook_prompts_today / facebook_prompts_total —
@@ -274,6 +281,7 @@ STAGE_NEW      = "new"             # never messaged before
 STAGE_WELCOMED = "welcomed"        # short welcome sent, waiting on their name
 STAGE_EXPLAINED = "explained"      # "real deal" (flyer image + packages caption) has been sent
 STAGE_SIGNUP   = "signup_sent"     # signup/registration link has been sent
+STAGE_SIGNUP_REMINDED = "signup_reminded"  # sent the one-time reminder after the signup link — done, silent
 STAGE_OWNER    = "owner_handling"  # pre-existing contact, or you stepped in manually — bot is silent forever
 STAGE_SOCIAL_WELCOMED = "social_welcomed"  # social-referral welcome sent, waiting on name
 STAGE_SOCIAL_SENT     = "social_link_sent" # subtle explanation + t.me link sent — done, silent
@@ -2494,13 +2502,16 @@ async def api_logs(request: Request):
 #      the message is an explicit payment-ready phrase (checked here so the
 #      exemption doesn't cost an extra API call on every paused message)
 #   2. You've personally replied in this chat        -> switch to silence
-#  2b. Explicit payment-ready phrase, any stage        -> signup link directly,
-#      even while paused (the only exception to the pause switch) and even
-#      after the social-referral flow below has already completed
+#  2b. Explicit payment-ready phrase, any stage BEFORE the signup link has
+#      gone out                                        -> signup link
+#      directly, even while paused (the only exception to the pause switch)
+#      and even after the social-referral flow below has already completed
 #  2c. Social-referral flow already completed         -> permanent silence
 #  2d. Already asked them for their receipt           -> permanent silence
 #  2e. Claims payment already made ("here's my receipt")  -> one reply asking
 #      for the receipt file, then permanent silence
+#  2f. Already sent the one-time signup reminder (step 13)  -> permanent
+#      silence — nothing auto-replies again, ever, for this chat
 #   3. Scam-ish keywords                             -> flag, silence
 #   4. Media message (photo/doc/etc.) once mid-flow  -> flag, silence
 #   5. Already joined/registered                     -> flag, silence
@@ -2515,13 +2526,15 @@ async def api_logs(request: Request):
 #      enabled — they were already handled above at 2c/7b.
 #   9. Direct Sale / referral question                -> answer directly
 #  10. Clear "I'm ready / let's go / how do we continue", excluding
-#      STAGE_WELCOMED                                  -> signup link
+#      STAGE_WELCOMED and the signup stages (2b/13 own those instead)
+#                                                       -> signup link
 #  11. Specific package/feature question              -> send the real deal
 #      (flyer image + packages caption)
 #  12. Any reply right after the welcome              -> send the real deal
 # 12b. Any reply right after the social welcome        -> subtle explanation
 #      + channel link
-#  13. Unrecognised message at signup stage           -> resend signup link
+#  13. Any message at signup stage not caught above   -> send the ONE-TIME
+#      signup reminder, then permanent silence (see 2f above)
 #  14. Unrecognised text at explained stage           -> flag, silence
 #  15. Anything else                                  -> silence, no chit-chat
 
@@ -2622,13 +2635,17 @@ async def handle_message(event, client):
 
     # ── 2b. Explicit payment-ready phrase ("I'm ready to make payment for
     #        Jovia Gold, please drop the payment link") — always sends the
-    #        full signup write-up, at ANY stage, including after the
-    #        social-referral flow has already completed (checked before
-    #        that silence below — a ready-to-pay lead should never be
-    #        dropped just because they already went through that flow), and
-    #        bypasses the pause switch above (the only exception to it).
-    #        Owner-silence still takes priority over this.
-    if text and matches_payment_ready(text):
+    #        full signup write-up, at ANY stage BEFORE the signup link has
+    #        already gone out (including after the social-referral flow has
+    #        already completed — a ready-to-pay lead should never be dropped
+    #        just because they already went through that flow), and bypasses
+    #        the pause switch above (the only exception to it). Once the
+    #        signup link has already been sent (STAGE_SIGNUP or
+    #        STAGE_SIGNUP_REMINDED), repeating this phrase does NOT resend it
+    #        — see 2f below for the one-reply-then-silent rule that governs
+    #        everything after the link goes out. Owner-silence still takes
+    #        priority over this.
+    if text and stage not in (STAGE_SIGNUP, STAGE_SIGNUP_REMINDED) and matches_payment_ready(text):
         was_new = stage == STAGE_NEW
         await human_delay(event, client, 5.0, 10.0)
         await send_reply(event, build_signup_message(get_name(chat_id) or sender.first_name))
@@ -2653,13 +2670,22 @@ async def handle_message(event, client):
     # ── 2e. They say they've already paid ("Just made payment for jovia,
     #        here's my receipt") — one reply asking them to drop the actual
     #        receipt file, then permanently silent. A human needs to look at
-    #        and confirm the receipt from here, not the bot.
+    #        and confirm the receipt from here, not the bot. Checked before
+    #        2f below so a genuine payment claim still gets this reply even
+    #        after the one-time signup reminder has already gone out.
     if text and matches_payment_receipt(text):
         await human_delay(event, client, 4.0, 8.0)
         await send_reply(event, PAYMENT_RECEIPT_REPLY)
         set_stage(chat_id, STAGE_RECEIPT_REQUESTED, sender_name, username)
         _record_action(sender_name, "receipt")
         log.info(f"[{sender_name}] Claims payment made — asked for receipt, now silent")
+        return
+
+    # ── 2f. Already sent the one-time reminder after the signup link (see
+    #        step 13 below) — stays silent for good. Nothing auto-replies
+    #        again after that, ever, for this chat.
+    if stage == STAGE_SIGNUP_REMINDED:
+        log.info(f"[{sender_name}] Signup reminder already sent — silent")
         return
 
     # ── 3. Scam-ish message — flag it, no auto-reply ──────────────────────────
@@ -2742,18 +2768,16 @@ async def handle_message(event, client):
         log.info(f"[{sender_name}] Sent: direct sale & spillover info")
         return
 
-    # ── 10. Clear join intent — signup link (or a short reminder). Excludes
-    #        STAGE_WELCOMED so a generic "I am ready" reply right after the
-    #        welcome is still treated as their name (step 12) and gets the
-    #        real deal — the payment link only follows a generic readiness
-    #        signal once the real deal is already out.
-    if text and stage != STAGE_WELCOMED and matches_join_intent(text):
-        if stage == STAGE_SIGNUP:
-            await human_delay(event, client, 3.0, 6.0)
-            await send_reply(event, SIGNUP_LINK_REMINDER)
-            _record_action(sender_name, "signup")
-            log.info(f"[{sender_name}] Sent: signup link reminder")
-            return
+    # ── 10. Clear join intent — signup link. Excludes STAGE_WELCOMED so a
+    #        generic "I am ready" reply right after the welcome is still
+    #        treated as their name (step 12) and gets the real deal — the
+    #        payment link only follows a generic readiness signal once the
+    #        real deal is already out. Also excludes STAGE_SIGNUP and
+    #        STAGE_SIGNUP_REMINDED — the link's already been sent, so a
+    #        repeat "ready"/"let's go" here falls through to step 13's
+    #        one-time-reminder-then-silent handling instead of resending
+    #        the full signup message again.
+    if text and stage not in (STAGE_WELCOMED, STAGE_SIGNUP, STAGE_SIGNUP_REMINDED) and matches_join_intent(text):
         name = get_name(chat_id) or sender.first_name
         await human_delay(event, client, 5.0, 10.0)
         await send_reply(event, build_signup_message(name))
@@ -2801,12 +2825,16 @@ async def handle_message(event, client):
         log.info(f"[{sender_name}] Sent: social explainer + channel link (name: {name!r})")
         return
 
-    # ── 13. Unrecognised message at signup stage — resend the link ────────────
+    # ── 13. Any message at signup stage that wasn't caught above — send the
+    #        ONE-TIME reminder and go permanently silent from here on (see
+    #        2f above, which catches every message after this one). Not "one
+    #        reminder per message" — exactly one, ever, for this chat.
     if stage == STAGE_SIGNUP:
         await human_delay(event, client, 3.0, 6.0)
         await send_reply(event, SIGNUP_LINK_REMINDER)
+        set_stage(chat_id, STAGE_SIGNUP_REMINDED, sender_name, username)
         _record_action(sender_name, "signup")
-        log.info(f"[{sender_name}] Sent: signup link reminder (unrecognised msg at signup stage)")
+        log.info(f"[{sender_name}] Sent: one-time signup link reminder — now silent for good")
         return
 
     # ── 14. Unrecognised text at explained stage — queue for human reply ──────
